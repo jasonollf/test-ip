@@ -1,0 +1,35 @@
+name: AS906 Front-IP Diagnostic (One-off)
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe AS906 candidate IPs
+        run: |
+          set +e
+          PROBE_HOST="ipv4.090227.xyz"
+          IPS="45.59.184.1 45.59.185.1 45.59.186.1 45.59.187.1 45.88.195.1 103.117.100.1 103.117.101.1 103.117.102.1 103.117.103.1 103.135.248.1 103.135.249.1 103.135.250.1 103.135.251.1 136.175.176.1 136.175.177.1 136.175.178.1 136.175.179.1 154.12.188.1 154.12.189.1 154.12.190.1 154.12.191.1 154.31.116.1 154.31.117.1 174.136.204.1 174.136.205.1 174.136.206.1 174.136.207.1 193.110.200.1 216.234.140.1 216.234.141.1 216.234.142.1 216.234.143.1"
+
+          echo "## AS906 探测结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| IP | 结果 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          hit_count=0
+          for ip in $IPS; do
+            resp=$(curl -s -m 6 --connect-timeout 3 --resolve "${PROBE_HOST}:443:${ip}" "https://${PROBE_HOST}/cdn-cgi/trace" 2>/dev/null)
+            if echo "$resp" | grep -q '^ip=' && echo "$resp" | grep -q '^colo='; then
+              colo=$(echo "$resp" | grep '^colo=' | cut -d'=' -f2 | tr -d '\r')
+              echo "✅ $ip  colo=$colo"
+              echo "| $ip | ✅ colo=$colo |" >> "$GITHUB_STEP_SUMMARY"
+              hit_count=$((hit_count+1))
+            else
+              echo "❌ $ip  未通过"
+              echo "| $ip | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**命中数：$hit_count / 32**" >> "$GITHUB_STEP_SUMMARY"
