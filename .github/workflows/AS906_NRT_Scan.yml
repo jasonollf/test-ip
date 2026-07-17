@@ -1,0 +1,89 @@
+name: AS906 Full-Range NRT Probe (One-off)
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch AS906 announced IPv4 prefixes
+        run: |
+          curl -s -m 30 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS906" -o prefixes.json
+          echo "原始前缀条数：$(python3 -c "import json;print(len(json.load(open('prefixes.json'))['data']['prefixes']))")"
+
+      - name: Expand prefixes into /24-sampled candidate IPs
+        run: |
+          python3 <<'EOF'
+          import json, ipaddress
+
+          data = json.load(open('prefixes.json'))
+          candidates = []
+          for p in data['data']['prefixes']:
+              prefix = p['prefix']
+              if ':' in prefix:
+                  continue  # 跳过 IPv6
+              net = ipaddress.ip_network(prefix, strict=False)
+              if net.prefixlen >= 24:
+                  hosts = list(net.hosts())
+                  if hosts:
+                      candidates.append(str(hosts[0]))
+              else:
+                  for sub in net.subnets(new_prefix=24):
+                      hosts = list(sub.hosts())
+                      if hosts:
+                          candidates.append(str(hosts[0]))
+
+          with open('candidates.txt', 'w') as f:
+              f.write('\n'.join(candidates))
+          print(f"候选 IP 总数：{len(candidates)}")
+          EOF
+
+      - name: "Probe all candidates, filter colo=NRT"
+        run: |
+          set +e
+          PROBE_HOST="ipv4.090227.xyz"
+          mkdir -p results
+
+          probe_one() {
+            local ip="$1"
+            resp=$(curl -s -m 6 --connect-timeout 3 --resolve "${PROBE_HOST}:443:${ip}" "https://${PROBE_HOST}/cdn-cgi/trace" 2>/dev/null)
+            if echo "$resp" | grep -q '^ip=' && echo "$resp" | grep -q '^colo='; then
+              colo=$(echo "$resp" | grep '^colo=' | cut -d'=' -f2 | tr -d '\r')
+              echo "${ip} colo=${colo}" > "results/${ip//./_}.txt"
+            fi
+            return 0
+          }
+          export -f probe_one
+          export PROBE_HOST
+
+          while IFS= read -r ip || [ -n "$ip" ]; do
+            [ -z "$ip" ] && continue
+            probe_one "$ip" &
+            if [ "$(jobs -r | wc -l)" -ge 15 ]; then
+              wait -n || true
+            fi
+          done < candidates.txt
+          wait
+
+          find results -name "*.txt" -exec cat {} + > all_hits.txt 2>/dev/null || > all_hits.txt
+          grep "colo=NRT" all_hits.txt > nrt_hits.txt || > nrt_hits.txt
+
+          echo "## AS906 全量探测结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "候选总数：$(wc -l < candidates.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo "全部通过 CF 边缘验证：$(wc -l < all_hits.txt) 个" >> "$GITHUB_STEP_SUMMARY"
+          echo "其中 colo=NRT：$(wc -l < nrt_hits.txt) 个" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### NRT 命中列表" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat nrt_hits.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: as906-probe-results
+          path: |
+            all_hits.txt
+            nrt_hits.txt
+            candidates.txt
