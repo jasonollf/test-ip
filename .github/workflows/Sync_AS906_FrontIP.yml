@@ -1,0 +1,216 @@
+name: Sync AS906 Front-IP Pool
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'  # 每天 UTC 06:00(台北 14:00)跑一次,频率先保守设置,观察稳定性后再调整
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Stage 0: Fetch AS906 announced IPv4 prefixes (RIPEstat, real-time)"
+        run: |
+          curl -s -m 30 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS906" -o prefixes.json
+          count=$(python3 -c "import json;print(len(json.load(open('prefixes.json'))['data']['prefixes']))")
+          echo "AS906 当前宣告前缀总数：$count"
+
+      name: Sync AS906 Front-IP Pool
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'  # 每天 UTC 06:00(台北 14:00)跑一次,频率先保守设置,观察稳定性后再调整
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Stage 0: Fetch AS906 announced IPv4 prefixes (RIPEstat, real-time)"
+        run: |
+          curl -s -m 30 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS906" -o prefixes.json
+          count=$(python3 -c "import json;print(len(json.load(open('prefixes.json'))['data']['prefixes']))")
+          echo "AS906 当前宣告前缀总数：$count"
+
+      - name: "Stage 1: Expand prefixes, /24-sample candidate IPs"
+        run: |
+          python3 <<'EOF'
+          import json, ipaddress
+
+          data = json.load(open('prefixes.json'))
+          candidates = []
+          for p in data['data']['prefixes']:
+              prefix = p['prefix']
+              if ':' in prefix:
+                  continue
+              net = ipaddress.ip_network(prefix, strict=False)
+              if net.prefixlen >= 24:
+                  hosts = list(net.hosts())
+                  if hosts:
+                      candidates.append(str(hosts[0]))
+              else:
+                  for sub in net.subnets(new_prefix=24):
+                      hosts = list(sub.hosts())
+                      if hosts:
+                          candidates.append(str(hosts[0]))
+
+          with open('candidates.txt', 'w') as f:
+              f.write('\n'.join(candidates))
+          print(f"候选 IP 总数：{len(candidates)}")
+          EOF
+
+      - name: "Stage 2: SNI-fronting probe, output ip:443#colo format for ALL, plus filtered subset"
+        run: |
+          set +e
+          PROBE_HOST="ipv4.090227.xyz"
+          TARGET_COLOS="NRT KIX FUK"
+          mkdir -p results
+
+          probe_one() {
+            local ip="$1"
+            resp=$(curl -s -m 6 --connect-timeout 3 --resolve "${PROBE_HOST}:443:${ip}" "https://${PROBE_HOST}/cdn-cgi/trace" 2>/dev/null)
+            if echo "$resp" | grep -q '^ip=' && echo "$resp" | grep -q '^colo='; then
+              colo=$(echo "$resp" | grep '^colo=' | cut -d'=' -f2 | tr -d '\r')
+              # 统一在源头就写成 ip:443#colo 格式,后续所有文件直接复用,不再有第二种格式
+              echo "${ip}:443#${colo}" > "results/${ip//./_}.txt"
+            fi
+            return 0
+          }
+          export -f probe_one
+          export PROBE_HOST
+
+          while IFS= read -r ip || [ -n "$ip" ]; do
+            [ -z "$ip" ] && continue
+            probe_one "$ip" &
+            if [ "$(jobs -r | wc -l)" -ge 15 ]; then
+              wait -n || true
+            fi
+          done < candidates.txt
+          wait
+
+          # 全量结果,已经是 ip:443#colo 格式,包含所有地区(含 LAX 等)
+          find results -name "*.txt" -exec cat {} + > all_hits.txt 2>/dev/null || > all_hits.txt
+
+          # 从全量里按 #后缀 匹配目标地区,筛出过滤后的子集,格式不变
+          > target_ips.txt
+          for colo in $TARGET_COLOS; do
+            grep "#${colo}$" all_hits.txt >> target_ips.txt
+          done
+
+          # 自检：确认 target_ips.txt 里出现的地区代码,100% 只在 TARGET_COLOS 范围内
+          bad_lines=$(awk -F'#' '{print $2}' target_ips.txt | sort -u | grep -vxFf <(echo "$TARGET_COLOS" | tr ' ' '\n'))
+          if [ -n "$bad_lines" ]; then
+            echo "🚨 自检失败：target_ips.txt 中出现了不在过滤名单内的地区：$bad_lines"
+            exit 1
+          fi
+
+          echo "## AS906 Front-IP 扫描结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "候选总数：$(wc -l < candidates.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo "通过 CF 边缘验证(全部地区)：$(wc -l < all_hits.txt) 个" >> "$GITHUB_STEP_SUMMARY"
+          echo "命中目标地区(NRT/KIX/FUK)：$(wc -l < target_ips.txt) 个" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ✅ as906_frontip.txt(已过滤,ip:443#地区)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat target_ips.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ℹ️ as906_all_colo.txt(全量参考,ip:443#地区,含 LAX 等)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat all_hits.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Stage 3: Push to independent Gist"
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: "5cbb121b59891523cddb7cd61c00a893"
+        run: |
+          if [ ! -s target_ips.txt ]; then
+            echo "🚨 本次没有命中目标地区的 IP,跳过 Gist 更新,保护现有内容"
+            exit 0
+          fi
+          git clone https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git gist_repo
+          cp target_ips.txt gist_repo/as906_frontip.txt
+          cp all_hits.txt gist_repo/as906_all_colo.txt
+          cd gist_repo
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add as906_frontip.txt as906_all_colo.txt
+          git commit -m "AS906 front-IP scan $(date -u +%Y-%m-%dT%H:%M:%SZ)" || exit 0
+          git push
+
+      - name: "Stage 2: SNI-fronting probe, output ip:443#colo format for ALL, plus filtered subset"
+        run: |
+          set +e
+          PROBE_HOST="ipv4.090227.xyz"
+          TARGET_COLOS="NRT KIX FUK"
+          mkdir -p results
+
+          probe_one() {
+            local ip="$1"
+            resp=$(curl -s -m 6 --connect-timeout 3 --resolve "${PROBE_HOST}:443:${ip}" "https://${PROBE_HOST}/cdn-cgi/trace" 2>/dev/null)
+            if echo "$resp" | grep -q '^ip=' && echo "$resp" | grep -q '^colo='; then
+              colo=$(echo "$resp" | grep '^colo=' | cut -d'=' -f2 | tr -d '\r')
+              # 统一在源头就写成 ip:443#colo 格式,后续所有文件直接复用,不再有第二种格式
+              echo "${ip}:443#${colo}" > "results/${ip//./_}.txt"
+            fi
+            return 0
+          }
+          export -f probe_one
+          export PROBE_HOST
+
+          while IFS= read -r ip || [ -n "$ip" ]; do
+            [ -z "$ip" ] && continue
+            probe_one "$ip" &
+            if [ "$(jobs -r | wc -l)" -ge 15 ]; then
+              wait -n || true
+            fi
+          done < candidates.txt
+          wait
+
+          # 全量结果,已经是 ip:443#colo 格式,包含所有地区(含 LAX 等)
+          find results -name "*.txt" -exec cat {} + > all_hits.txt 2>/dev/null || > all_hits.txt
+
+          # 从全量里按 #后缀 匹配目标地区,筛出过滤后的子集,格式不变
+          > target_ips.txt
+          for colo in $TARGET_COLOS; do
+            grep "#${colo}$" all_hits.txt >> target_ips.txt
+          done
+
+          # 自检：确认 target_ips.txt 里出现的地区代码,100% 只在 TARGET_COLOS 范围内
+          bad_lines=$(awk -F'#' '{print $2}' target_ips.txt | sort -u | grep -vxFf <(echo "$TARGET_COLOS" | tr ' ' '\n'))
+          if [ -n "$bad_lines" ]; then
+            echo "🚨 自检失败：target_ips.txt 中出现了不在过滤名单内的地区：$bad_lines"
+            exit 1
+          fi
+
+          echo "## AS906 Front-IP 扫描结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "候选总数：$(wc -l < candidates.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo "通过 CF 边缘验证(全部地区)：$(wc -l < all_hits.txt) 个" >> "$GITHUB_STEP_SUMMARY"
+          echo "命中目标地区(NRT/KIX/FUK)：$(wc -l < target_ips.txt) 个" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ✅ as906_frontip.txt(已过滤,ip:443#地区)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat target_ips.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ℹ️ as906_all_colo.txt(全量参考,ip:443#地区,含 LAX 等)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat all_hits.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Stage 3: Push to independent Gist"
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: "5cbb121b59891523cddb7cd61c00a893"
+        run: |
+          if [ ! -s target_ips.txt ]; then
+            echo "🚨 本次没有命中目标地区的 IP,跳过 Gist 更新,保护现有内容"
+            exit 0
+          fi
+          git clone https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git gist_repo
+          cp target_ips.txt gist_repo/as906_frontip.txt
+          cp all_hits.txt gist_repo/as906_all_colo.txt
+          cd gist_repo
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add as906_frontip.txt as906_all_colo.txt
+          git commit -m "AS906 front-IP scan $(date -u +%Y-%m-%dT%H:%M:%SZ)" || exit 0
+          git push
