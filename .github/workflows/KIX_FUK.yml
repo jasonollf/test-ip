@@ -132,8 +132,23 @@ jobs:
           echo "候选总数：$(wc -l < candidates.txt)" >> "$GITHUB_STEP_SUMMARY"
           echo "通过 CF 边缘验证(全部地区)：$(wc -l < all_hits.txt) 个" >> "$GITHUB_STEP_SUMMARY"
           echo "其中 colo=KIX/FUK：$(wc -l < target_hits.txt) 个" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 目标节点 (KIX|FUK)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat target_hits.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ -s target_hits.txt ]; then
+            cat target_hits.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "无" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 全部通过 CF 边缘验证的 IP 及 Colo" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s all_hits.txt ]; then
+            cat all_hits.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "无" >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
