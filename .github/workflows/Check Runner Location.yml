@@ -1,0 +1,76 @@
+name: Check Runner Location
+
+on:
+  workflow_dispatch: # 允许在 GitHub Actions 页面手动触发
+  push:
+    branches:
+      - main         # 推送到 main 分支时自动触发
+
+jobs:
+  get-location:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 获取 Runner IP 并输出到 Job Summary
+        run: |
+          # 1. 请求 IP 及地理位置接口
+          RESPONSE=$(curl -s https://ipinfo.io/json)
+
+          # 2. 解析 JSON 字段
+          IP=$(echo "$RESPONSE" | jq -r '.ip // "未知"')
+          CITY=$(echo "$RESPONSE" | jq -r '.city // "未知"')
+          REGION=$(echo "$RESPONSE" | jq -r '.region // "未知"')
+          COUNTRY=$(echo "$RESPONSE" | jq -r '.country // "未知"')
+          LOC=$(echo "$RESPONSE" | jq -r '.loc // "未知"')
+          ORG=$(echo "$RESPONSE" | jq -r '.org // "未知"')
+          TIMEZONE=$(echo "$RESPONSE" | jq -r '.timezone // "未知"')
+
+          # 3. 自动判断美东 / 美西 / 美中等方位
+          ZONE="其他/非美国地区"
+          case "$REGION" in
+            "Virginia"|"Georgia"|"North Carolina"|"South Carolina"|"New York"|"New Jersey"|"Pennsylvania"|"Florida"|"Massachusetts"|"Maryland")
+              ZONE="🇺🇸 美东 (US East)"
+              ;;
+            "California"|"Washington"|"Oregon"|"Arizona"|"Nevada")
+              ZONE="🇺🇸 美西 (US West)"
+              ;;
+            "Iowa"|"Texas"|"Illinois"|"Kansas"|"Nebraska"|"Missouri"|"Oklahoma")
+              ZONE="🇺🇸 美中 (US Central)"
+              ;;
+            *)
+              if [ "$COUNTRY" = "US" ]; then
+                ZONE="🇺🇸 美国其他区域 ($REGION)"
+              fi
+              ;;
+          esac
+
+          # 4. 优化控制台终端显示格式
+          echo "=========================================="
+          echo "🌐 GitHub Runner 网络节点信息"
+          echo "=========================================="
+          echo "公网 IP    : $IP"
+          echo "所属方位   : $ZONE"
+          echo "城市地区   : $CITY, $REGION ($COUNTRY)"
+          echo "地理坐标   : $LOC"
+          echo "云厂商/ISP : $ORG"
+          echo "=========================================="
+
+          # 5. 输出高颜值 Markdown 表格到 GitHub Step Summary
+          cat <<EOF >> $GITHUB_STEP_SUMMARY
+          ## 🌐 GitHub Runner 运行节点与 IP 位置
+
+          > **查询状态**：✅ 成功 | **执行时间 (UTC)**：$(date -u '+%Y-%m-%d %H:%M:%S')
+
+          | 属性指标 | 详细信息 |
+          | :--- | :--- |
+          | 📍 **区域方位** | **$ZONE** |
+          | 🌐 **公网 IP** | \`$IP\` |
+          | 🏙️ **城市/州** | **$CITY**, $REGION |
+          | 🏳️ **国家** | $COUNTRY |
+          | 🧭 **地理坐标** | \`$LOC\` |
+          | ⏰ **节点时区** | $TIMEZONE |
+          | 🏢 **云服务商** | $ORG |
+
+          ---
+          > 💡 **提示**：GitHub 托管的 Runner 运行在 Azure 云端，系统每次随机分配虚拟机，因此 IP 和方位（美东/美西/美中）在多次运行间可能会变化。
+          EOF
