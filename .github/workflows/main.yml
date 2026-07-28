@@ -1,4 +1,4 @@
-name: AS906 APAC All-TLS-Ports One-off Scan
+name: AS906 Japan All-TLS-Ports One-off Scan
 on:
   workflow_dispatch:
 
@@ -12,12 +12,12 @@ jobs:
           count=$(python3 -c "import json;print(len(json.load(open('prefixes.json'))['data']['prefixes']))")
           echo "AS906 当前宣告前缀总数：$count"
 
-      - name: "Stage 0.5: Geo-filter prefixes to APAC via ip-api.com batch"
+      - name: "Stage 0.5: Geo-filter prefixes to Japan via ip-api.com batch"
         run: |
           python3 <<'EOF'
           import json, ipaddress, urllib.request
 
-          APAC = {"JP","TW","HK","SG","KR","MY","PH","TH","VN","ID"}
+          TARGET_REGION = {"JP"}
 
           data = json.load(open('prefixes.json'))
           prefixes = [p['prefix'] for p in data['data']['prefixes'] if ':' not in p['prefix']]
@@ -49,13 +49,13 @@ jobs:
           survivors = []
           for pfx, ip in zip(nets, rep_ips):
               cc = geo.get(ip)
-              if cc in APAC:
+              if cc in TARGET_REGION:
                   survivors.append(pfx)
 
           with open('survivors.json', 'w') as f:
               json.dump(survivors, f)
 
-          print(f"地理定位完成,APAC 存活前缀数：{len(survivors)} / {len(nets)}")
+          print(f"地理定位完成,Japan 存活前缀数：{len(survivors)} / {len(nets)}")
           EOF
 
       - name: "Stage 1: Sample multiple IPs per surviving /24, dynamic cap toward ~2000 total"
@@ -69,7 +69,7 @@ jobs:
           candidates = []
 
           if not survivors:
-              print("⚠️ 没有 APAC 存活前缀,候选池为空")
+              print("⚠️ 没有 Japan 存活前缀,候选池为空")
           else:
               per_prefix = max(1, math.ceil(TARGET_TOTAL / len(survivors)))
               for pfx in survivors:
@@ -135,7 +135,7 @@ jobs:
 
           find results -name "*.txt" -exec cat {} + > all_hits.txt 2>/dev/null || > all_hits.txt
 
-          echo "## AS906 全部 TLS 端口扫描结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "## AS906 Japan 全部 TLS 端口扫描结果" >> "$GITHUB_STEP_SUMMARY"
           echo "候选 IP 总数：$(wc -l < candidates.txt)" >> "$GITHUB_STEP_SUMMARY"
           echo "通过 CF 边缘验证的 IP:端口 组合总数：$(wc -l < all_hits.txt) 个" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -151,7 +151,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: as906-all-tls-results
+          name: as906-japan-all-tls-results
           path: |
             survivors.json
             candidates.txt
