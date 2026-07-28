@@ -1,0 +1,158 @@
+name: AS906 APAC All-TLS-Ports One-off Scan
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Stage 0: Fetch AS906 announced IPv4 prefixes (RIPEstat, real-time)"
+        run: |
+          curl -s -m 30 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS906" -o prefixes.json
+          count=$(python3 -c "import json;print(len(json.load(open('prefixes.json'))['data']['prefixes']))")
+          echo "AS906 当前宣告前缀总数：$count"
+
+      - name: "Stage 0.5: Geo-filter prefixes to APAC via ip-api.com batch"
+        run: |
+          python3 <<'EOF'
+          import json, ipaddress, urllib.request
+
+          APAC = {"JP","TW","HK","SG","KR","MY","PH","TH","VN","ID"}
+
+          data = json.load(open('prefixes.json'))
+          prefixes = [p['prefix'] for p in data['data']['prefixes'] if ':' not in p['prefix']]
+
+          rep_ips = []
+          nets = []
+          for pfx in prefixes:
+              net = ipaddress.ip_network(pfx, strict=False)
+              hosts = list(net.hosts())
+              if hosts:
+                  rep_ips.append(str(hosts[0]))
+                  nets.append(pfx)
+
+          geo = {}
+          for i in range(0, len(rep_ips), 100):
+              batch = rep_ips[i:i+100]
+              req = urllib.request.Request(
+                  "http://ip-api.com/batch?fields=query,countryCode",
+                  data=json.dumps(batch).encode(),
+                  headers={"Content-Type": "application/json"}
+              )
+              try:
+                  resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+                  for r in resp:
+                      geo[r.get("query")] = r.get("countryCode")
+              except Exception as e:
+                  print(f"batch {i} 查询失败: {e}")
+
+          survivors = []
+          for pfx, ip in zip(nets, rep_ips):
+              cc = geo.get(ip)
+              if cc in APAC:
+                  survivors.append(pfx)
+
+          with open('survivors.json', 'w') as f:
+              json.dump(survivors, f)
+
+          print(f"地理定位完成,APAC 存活前缀数：{len(survivors)} / {len(nets)}")
+          EOF
+
+      - name: "Stage 1: Sample multiple IPs per surviving /24, dynamic cap toward ~2000 total"
+        run: |
+          python3 <<'EOF'
+          import json, ipaddress, random, math
+
+          TARGET_TOTAL = 2000
+
+          survivors = json.load(open('survivors.json'))
+          candidates = []
+
+          if not survivors:
+              print("⚠️ 没有 APAC 存活前缀,候选池为空")
+          else:
+              per_prefix = max(1, math.ceil(TARGET_TOTAL / len(survivors)))
+              for pfx in survivors:
+                  net = ipaddress.ip_network(pfx, strict=False)
+                  if net.prefixlen >= 24:
+                      subnets = [net]
+                  else:
+                      subnets = list(net.subnets(new_prefix=24))
+                  for sub in subnets:
+                      hosts = list(sub.hosts())
+                      if not hosts:
+                          continue
+                      if len(hosts) <= per_prefix:
+                          candidates.extend(str(h) for h in hosts)
+                      else:
+                          candidates.extend(str(h) for h in random.sample(hosts, per_prefix))
+
+              if len(candidates) > TARGET_TOTAL:
+                  candidates = random.sample(candidates, TARGET_TOTAL)
+
+          with open('candidates.txt', 'w') as f:
+              f.write('\n'.join(candidates))
+          print(f"每前缀采样数(动态)：{per_prefix if survivors else 0}，最终候选总数：{len(candidates)}")
+          EOF
+
+      - name: "Stage 2: SNI-fronting probe for ALL CF TLS ports, output ip:port#colo"
+        run: |
+          set +e
+          PROBE_HOST="ipv4.090227.xyz"
+          mkdir -p results
+
+          # 定义 Cloudflare 支持的所有 TLS 端口
+          TLS_PORTS=(443 2053 2083 2087 2096 8443)
+
+          probe_one() {
+            local ip="$1"
+            local port="$2"
+            # 使用对应端口发起 HTTPS 探测
+            resp=$(curl -s -m 6 --connect-timeout 3 --resolve "${PROBE_HOST}:${port}:${ip}" "https://${PROBE_HOST}:${port}/cdn-cgi/trace" 2>/dev/null)
+            if echo "$resp" | grep -q '^ip=' && echo "$resp" | grep -q '^colo='; then
+              colo=$(echo "$resp" | grep '^colo=' | cut -d'=' -f2 | tr -d '\r')
+              echo "${ip}:${port}#${colo}" > "results/${ip//./_}_${port}.txt"
+            fi
+            return 0
+          }
+          export -f probe_one
+          export PROBE_HOST
+
+          if [ -s candidates.txt ]; then
+            while IFS= read -r ip || [ -n "$ip" ]; do
+              [ -z "$ip" ] && continue
+              # 对每个 IP 遍历所有 TLS 端口进行探测
+              for port in "${TLS_PORTS[@]}"; do
+                probe_one "$ip" "$port" &
+                # 提高并发数至 50 以应对探测量倍增
+                if [ "$(jobs -r | wc -l)" -ge 50 ]; then
+                  wait -n || true
+                fi
+              done
+            done < candidates.txt
+            wait
+          fi
+
+          find results -name "*.txt" -exec cat {} + > all_hits.txt 2>/dev/null || > all_hits.txt
+
+          echo "## AS906 全部 TLS 端口扫描结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "候选 IP 总数：$(wc -l < candidates.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo "通过 CF 边缘验证的 IP:端口 组合总数：$(wc -l < all_hits.txt) 个" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 符合条件的完整列表 (IP:端口#Colo)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s all_hits.txt ]; then
+            cat all_hits.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "无" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: as906-all-tls-results
+          path: |
+            survivors.json
+            candidates.txt
+            all_hits.txt
