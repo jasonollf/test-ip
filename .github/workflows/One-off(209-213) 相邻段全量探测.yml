@@ -1,0 +1,341 @@
+name: "One-off 相邻段全量探测"
+
+# 一次性诊断工具，与主 workflow(Sync AS906 Front-IP Pool) 完全独立：
+#   不读写任何 gist、不需要任何 secrets、不影响主流程的任何状态。
+#
+# 目的：验证"客户端路径质量是否按 BGP 宣告前缀聚簇"。
+#   做法是把已验证优质 IP 所在的宣告段(种子段)与地址空间上最邻近的若干宣告段
+#   全部全量探测一遍，按段分组输出 colo=NRT 的 IP 清单，供在客户端逐段实测。
+#
+# 探测判定与主 workflow 的 Stage 2 逐字一致(同 PROBE_HOST、同 curl 参数、同
+# colo 提取方式)，否则两边结果没有可比性。此处不做 Worker 严格 IPv4 判定，也不
+# 做吞吐测试——那两项都是 runner 侧测量，对客户端实际可用性没有预测力。
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed_ips:
+        description: "已在客户端验证过的优质 IP(逗号分隔)，用于定位种子段"
+        required: true
+        default: "191.222.209.200,191.222.213.120"
+      neighbor_count:
+        description: "种子段之外，额外探测的最邻近宣告段数量"
+        required: true
+        default: "4"
+      max_probes:
+        description: "探测总量上限(某段装不下时整段跳过，不做部分采样)"
+        required: true
+        default: "6000"
+      concurrency:
+        description: "并发数(主 workflow 用 15，改大只影响速度不影响判定)"
+        required: true
+        default: "15"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: "Stage 0: 拉取 AS906 实时宣告前缀"
+        run: |
+          curl -s -m 30 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS906" -o prefixes.json
+          count=$(python3 -c "import json;print(len(json.load(open('prefixes.json'))['data']['prefixes']))")
+          echo "AS906 当前宣告前缀总数：$count"
+
+      - name: "Stage 1: 定位种子段 → 选取最邻近宣告段 → 全量枚举"
+        env:
+          SEED_IPS: ${{ inputs.seed_ips }}
+          NEIGHBOR_COUNT: ${{ inputs.neighbor_count }}
+          MAX_PROBES: ${{ inputs.max_probes }}
+        run: |
+          python3 <<'EOF'
+          import json, ipaddress, os, sys
+
+          seed_raw = os.environ.get('SEED_IPS', '')
+          neighbor_count = int(os.environ.get('NEIGHBOR_COUNT', '4'))
+          max_probes = int(os.environ.get('MAX_PROBES', '6000'))
+
+          data = json.load(open('prefixes.json'))
+
+          # 按 CIDR 去重：AS906 存在同时宣告聚合前缀与其内部子段的情况，
+          # 重复条目会让"最邻近"的排序结果里出现同一块地址空间的多个副本。
+          uniq = {}
+          for p in data['data']['prefixes']:
+              pfx = p['prefix']
+              if ':' in pfx:
+                  continue
+              try:
+                  net = ipaddress.ip_network(pfx, strict=False)
+              except ValueError:
+                  continue
+              uniq[str(net)] = net
+          prefixes = sorted(uniq.values(), key=lambda n: int(n.network_address))
+          print(f"IPv4 宣告前缀(去重后)：{len(prefixes)}")
+
+          # ---------- 定位种子段 ----------
+          seeds, seed_keys, seed_of = [], set(), {}
+          for raw in seed_raw.split(','):
+              ip = raw.strip()
+              if not ip:
+                  continue
+              try:
+                  addr = ipaddress.ip_address(ip)
+              except ValueError:
+                  print(f"⚠️ 跳过非法种子 IP：{ip}")
+                  continue
+              matched = [n for n in prefixes if addr in n]
+              if not matched:
+                  print(f"⚠️ 种子 {ip} 不在 AS906 当前宣告范围内(可能已撤销宣告)")
+                  continue
+              # 同一 IP 可能同时落在 /22 与其内部 /24：取最具体的那条，
+              # 因为路由决策用的是最长匹配。
+              best = max(matched, key=lambda n: n.prefixlen)
+              seed_of.setdefault(str(best), []).append(ip)
+              if str(best) not in seed_keys:
+                  seed_keys.add(str(best))
+                  seeds.append(best)
+              print(f"种子 {ip} → 宣告段 {best}")
+
+          if not seeds:
+              print("❌ 没有任何种子 IP 能定位到 AS906 宣告段，无法确定探测范围")
+              sys.exit(1)
+
+          # ---------- 按地址空间距离选取邻近段 ----------
+          def gap_to_seeds(net):
+              best = None
+              a0, a1 = int(net.network_address), int(net.broadcast_address)
+              for s in seeds:
+                  s0, s1 = int(s.network_address), int(s.broadcast_address)
+                  if a0 > s1:
+                      g = a0 - s1
+                  elif a1 < s0:
+                      g = s0 - a1
+                  else:
+                      g = 0          # 与种子段重叠
+                  if best is None or g < best:
+                      best = g
+              return best
+
+          others = [n for n in prefixes if str(n) not in seed_keys]
+          others.sort(key=lambda n: (gap_to_seeds(n), int(n.network_address)))
+          neighbors = others[:max(0, neighbor_count)]
+
+          # ---------- 全量枚举，超预算整段跳过 ----------
+          selected, targets, seen_ip, skipped = [], [], set(), []
+          used = 0
+
+          def usable_size(net):
+              # /31、/32 没有网络位与广播位的概念，hosts() 会返回全部地址
+              return net.num_addresses if net.prefixlen >= 31 else net.num_addresses - 2
+
+          for net, role in [(n, 'seed') for n in seeds] + [(n, 'neighbor') for n in neighbors]:
+              size = usable_size(net)
+              if size <= 0:
+                  continue
+              if used + size > max_probes:
+                  # 不做部分采样：半量结果无法支撑"这个段好不好"的判断
+                  skipped.append({"cidr": str(net), "role": role, "size": size})
+                  continue
+              fresh = []
+              for h in net.hosts():
+                  s = str(h)
+                  if s not in seen_ip:
+                      seen_ip.add(s)
+                      fresh.append(s)
+              if not fresh:
+                  continue
+              targets.extend(fresh)
+              used += len(fresh)
+              selected.append({
+                  "cidr": str(net),
+                  "role": role,
+                  "size": len(fresh),
+                  "gap": 0 if role == 'seed' else gap_to_seeds(net),
+                  "seed_ips": seed_of.get(str(net), []),
+              })
+
+          with open('targets.txt', 'w') as f:
+              for ip in targets:
+                  f.write(ip + '\n')
+
+          with open('selected_segments.json', 'w') as f:
+              json.dump({"selected": selected, "skipped": skipped}, f)
+
+          print("")
+          print(f"选中段数：{len(selected)}，探测总量：{len(targets)}")
+          for s in selected:
+              tag = "种子段" if s['role'] == 'seed' else f"邻近段(间隔 {s['gap']} 个地址)"
+              print(f"  {s['cidr']:<20} {tag:<28} {s['size']} 个主机")
+          for s in skipped:
+              print(f"  ⏭️ 跳过 {s['cidr']}({s['size']} 个主机，超出 max_probes={max_probes})")
+          EOF
+
+      - name: "Stage 2: 全量 SNI-fronting 探测(判定逻辑与主 workflow 一致)"
+        env:
+          CONCURRENCY_INPUT: ${{ inputs.concurrency }}
+        run: |
+          set +e
+          PROBE_HOST="ipv4.090227.xyz"
+          CONCURRENCY="${CONCURRENCY_INPUT:-15}"
+
+          probe_one() {
+            local ip="$1"
+            local outdir="$2"
+            resp=$(curl -s -m 6 --connect-timeout 3 --resolve "${PROBE_HOST}:443:${ip}" "https://${PROBE_HOST}/cdn-cgi/trace" 2>/dev/null)
+            if echo "$resp" | grep -q '^ip=' && echo "$resp" | grep -q '^colo='; then
+              colo=$(echo "$resp" | grep '^colo=' | cut -d'=' -f2 | tr -d '\r')
+              echo "${ip}:443#${colo}" > "${outdir}/${ip//./_}.txt"
+            fi
+            return 0
+          }
+          export -f probe_one
+          export PROBE_HOST
+
+          mkdir -p results
+          touch targets.txt
+          total=$(wc -l < targets.txt 2>/dev/null)
+          [ -z "$total" ] && total=0
+          echo "开始探测 ${total} 个 IP，并发 ${CONCURRENCY}..."
+
+          while IFS= read -r ip || [ -n "$ip" ]; do
+            [ -z "$ip" ] && continue
+            probe_one "$ip" results &
+            if [ "$(jobs -r | wc -l)" -ge "$CONCURRENCY" ]; then
+              wait -n || true
+            fi
+          done < targets.txt
+          wait
+
+          find results -name "*.txt" -exec cat {} + > all_hits.txt 2>/dev/null || > all_hits.txt
+          cf=$(wc -l < all_hits.txt 2>/dev/null)
+          [ -z "$cf" ] && cf=0
+          # grep -c 无匹配时既打印 0 又返回退出码 1，写成 $(... || echo 0) 会得到 "0\n0"
+          nrt=$(grep -c '#NRT$' all_hits.txt 2>/dev/null)
+          [ -z "$nrt" ] && nrt=0
+          echo "探测完成：CF 边缘命中 ${cf} 个，其中 colo=NRT ${nrt} 个"
+
+      - name: "Stage 3: 按段汇总，输出可直接复制到客户端的清单"
+        if: always()
+        run: |
+          python3 <<'EOF'
+          import json, ipaddress, os, collections
+
+          try:
+              meta = json.load(open('selected_segments.json'))
+          except Exception:
+              meta = {"selected": [], "skipped": []}
+          selected = meta.get('selected', [])
+          skipped = meta.get('skipped', [])
+
+          hits = {}
+          if os.path.exists('all_hits.txt'):
+              with open('all_hits.txt') as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line or '#' not in line:
+                          continue
+                      ipport, colo = line.split('#', 1)
+                      ip = ipport.split(':', 1)[0]
+                      try:
+                          ipaddress.ip_address(ip)
+                      except ValueError:
+                          continue
+                      hits[ip] = colo
+
+          out = []
+          w = out.append
+          w("# AS906 相邻段全量探测结果")
+          w("")
+
+          if not selected:
+              w("⚠️ 没有选中任何段，请检查 Stage 1 日志。")
+          else:
+              w("## 一、总览")
+              w("")
+              w("| 宣告段 | 角色 | 探测数 | CF 命中 | NRT 命中 | NRT 密度 |")
+              w("|---|---|---:|---:|---:|---:|")
+
+              per_seg = []
+              for s in selected:
+                  net = ipaddress.ip_network(s['cidr'])
+                  seg_hits = [(ip, c) for ip, c in hits.items()
+                              if ipaddress.ip_address(ip) in net]
+                  nrt = sorted([ip for ip, c in seg_hits if c == 'NRT'],
+                               key=lambda x: int(ipaddress.ip_address(x)))
+                  other = collections.Counter(c for _, c in seg_hits if c != 'NRT')
+                  density = (len(nrt) / s['size'] * 100) if s['size'] else 0.0
+                  role = "🌱 种子段" if s['role'] == 'seed' else f"邻近(间隔{s['gap']})"
+                  w(f"| `{s['cidr']}` | {role} | {s['size']} | {len(seg_hits)} | "
+                    f"**{len(nrt)}** | {density:.2f}% |")
+                  per_seg.append((s, nrt, other))
+
+              w("")
+              if skipped:
+                  w("**因超出 max_probes 被整段跳过：**")
+                  for s in skipped:
+                      w(f"- `{s['cidr']}`({s['size']} 个主机)")
+                  w("")
+
+              w("## 二、分段清单(逐段复制到客户端实测)")
+              w("")
+              w("> 判断方式：**同一段内的 IP 应该表现一致**。若某段的 IP 在客户端普遍低延迟，")
+              w("> 说明路径质量按前缀聚簇，该段可整体列入白名单；若同段内时好时坏，")
+              w("> 说明聚簇假设不成立，需要退回到逐 IP 评估。")
+              w("")
+
+              for s, nrt, other in per_seg:
+                  head = f"### `{s['cidr']}`"
+                  if s['role'] == 'seed':
+                      head += f"　🌱 种子段(已验证：{', '.join(s['seed_ips'])})"
+                  else:
+                      head += f"　邻近段(与种子段间隔 {s['gap']} 个地址)"
+                  w(head)
+                  w("")
+                  if nrt:
+                      w(f"colo=NRT 命中 **{len(nrt)}** 个：")
+                      w("")
+                      w("```")
+                      for ip in nrt:
+                          w(ip)
+                      w("```")
+                  else:
+                      w("colo=NRT 命中 **0** 个。")
+                  if other:
+                      w("")
+                      w("其他 colo：" + "、".join(f"{k}×{v}" for k, v in other.most_common()))
+                  w("")
+
+              all_nrt = sorted([ip for ip, c in hits.items() if c == 'NRT'],
+                               key=lambda x: int(ipaddress.ip_address(x)))
+              w("## 三、全部 NRT 命中(合并清单)")
+              w("")
+              w(f"共 **{len(all_nrt)}** 个：")
+              w("")
+              w("```")
+              for ip in all_nrt:
+                  w(ip)
+              w("```")
+
+          report = "\n".join(out) + "\n"
+          with open('report.md', 'w') as f:
+              f.write(report)
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a') as f:
+                  f.write(report)
+          print(report)
+          EOF
+
+      - name: "Stage 4: 上传结果文件"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: as906-neighbor-scan
+          path: |
+            report.md
+            all_hits.txt
+            selected_segments.json
+            targets.txt
+          if-no-files-found: warn
+          retention-days: 14
