@@ -1,0 +1,183 @@
+name: AS906 One-off Segment Probe (103.117.103.199)
+on:
+  workflow_dispatch: # 仅手动触发；一次性诊断用途，不推送 Gist/DNS，结果只写入 Job Summary
+
+jobs:
+  probe-segment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Step 1: Fetch AS906 prefixes, locate the atomic segment containing 103.117.103.199"
+        run: |
+          set -e
+          curl -s -m 30 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS906" -o prefixes.json
+          count=$(python3 -c "import json;print(len(json.load(open('prefixes.json'))['data']['prefixes']))")
+          echo "AS906 当前宣告前缀总数：$count"
+
+          python3 <<'EOF'
+          import json, ipaddress, sys
+
+          TARGET_IP = ipaddress.ip_address("103.117.103.199")
+
+          data = json.load(open('prefixes.json'))
+          prefixes = [p['prefix'] for p in data['data']['prefixes'] if ':' not in p['prefix']]
+
+          matched = None
+          for pfx in prefixes:
+              net = ipaddress.ip_network(pfx, strict=False)
+              if TARGET_IP in net:
+                  matched = net
+                  break
+
+          if matched is None:
+              print(f"❌ {TARGET_IP} 不在 AS906 当前宣告的任何 IPv4 前缀内，终止")
+              sys.exit(1)
+
+          # 与生产 Stage 0.5 相同的归一化口径：
+          # prefixlen >= 24（本身就是 /24 或更小的块，如 /25/26）→ 该前缀本身即原子单元；
+          # prefixlen < 24（比 /24 更大的聚合块）→ 取包含目标 IP 的那个 /24 子网作为原子单元。
+          if matched.prefixlen >= 24:
+              segment = matched
+          else:
+              segment = ipaddress.ip_network(f"{TARGET_IP}/24", strict=False)
+
+          hosts = [str(h) for h in segment.hosts()]
+
+          with open('candidates.txt', 'w') as f:
+              f.write('\n'.join(hosts))
+              if hosts:
+                  f.write('\n')
+
+          with open('segment_info.json', 'w') as f:
+              json.dump({
+                  "matched_announced_prefix": str(matched),
+                  "segment": str(segment),
+                  "host_count": len(hosts)
+              }, f)
+
+          print(f"✅ 命中宣告前缀：{matched}")
+          print(f"✅ 归一化后原子单元（本次探测目标段）：{segment}，可用主机数：{len(hosts)}")
+          EOF
+
+      - name: "Step 2: SNI-fronting probe (full segment, no sampling), extract colo for ALL"
+        run: |
+          set +e
+          PROBE_HOST="ipv4.090227.xyz"
+          mkdir -p results
+
+          probe_one() {
+            local ip="$1"
+            resp=$(curl -s -m 6 --connect-timeout 3 --resolve "${PROBE_HOST}:443:${ip}" "https://${PROBE_HOST}/cdn-cgi/trace" 2>/dev/null)
+            if echo "$resp" | grep -q '^ip=' && echo "$resp" | grep -q '^colo='; then
+              colo=$(echo "$resp" | grep '^colo=' | cut -d'=' -f2 | tr -d '\r')
+              echo "${ip}:443#${colo}" > "results/${ip//./_}.txt"
+            fi
+            return 0
+          }
+          export -f probe_one
+          export PROBE_HOST
+
+          total=0
+          if [ -s candidates.txt ]; then
+            while IFS= read -r ip || [ -n "$ip" ]; do
+              [ -z "$ip" ] && continue
+              total=$((total + 1))
+              probe_one "$ip" &
+              if [ "$(jobs -r | wc -l)" -ge 15 ]; then
+                wait -n || true
+              fi
+            done < candidates.txt
+            wait
+          fi
+
+          find results -name "*.txt" -exec cat {} + > all_hits.txt 2>/dev/null || > all_hits.txt
+          echo "探测总数：${total}"
+          echo "✅ 通过 CF 边缘验证(全部地区,含colo)：$(wc -l < all_hits.txt) 个"
+
+      - name: "Step 3: Filter to colo=NRT, tag supports_ipv4 via Worker (tag only, no elimination)"
+        env:
+          PROBE_WORKER_URL: ${{ secrets.PROBE_WORKER_URL }}
+        run: |
+          set +e
+
+          grep '#NRT$' all_hits.txt > nrt_hits.txt || > nrt_hits.txt
+          echo "✅ 其中 colo=NRT 命中：$(wc -l < nrt_hits.txt) 个"
+
+          > nrt_hits_tagged.txt
+          if [ -z "${PROBE_WORKER_URL}" ]; then
+            echo "⚠️ 未配置 PROBE_WORKER_URL，跳过 v4 标签校验，NRT 命中列表不做 v4/非v4 区分"
+            cp nrt_hits.txt nrt_hits_tagged.txt
+          else
+            mkdir -p v4check_workspace
+
+            check_v4() {
+              local line="$1"
+              local ip port colo_part ip_port parsed success
+              ip=$(echo "$line" | cut -d':' -f1)
+              port=$(echo "$line" | cut -d':' -f2 | cut -d'#' -f1)
+              colo_part=$(echo "$line" | cut -d'#' -f2)
+              ip_port="${ip}:${port}"
+
+              # 严格 IPv4-only 判定，与生产 Stage 2.5 口径一致：success 且 supports_ipv4 为真，
+              # 且 supports_ipv6 必须为假；仅打标签，不淘汰。
+              parsed=$(curl -s -m 10 --connect-timeout 3 "${PROBE_WORKER_URL%/}/check?proxyip=${ip_port}&timeoutMs=6000" 2>/dev/null | python3 -c "import sys,json; d=json.loads(sys.stdin.read().strip() or '{}'); print(1 if (d.get('success') and d.get('supports_ipv4') and not d.get('supports_ipv6')) else 0)" 2>/dev/null)
+
+              [ -z "$parsed" ] && parsed="0"
+
+              if [ "$parsed" == "1" ]; then
+                echo "${ip}:${port}#${colo_part}(v4)" > "v4check_workspace/${ip//./_}_${port}.txt"
+              else
+                echo "$line" > "v4check_workspace/${ip//./_}_${port}.txt"
+              fi
+              return 0
+            }
+            export -f check_v4
+            export PROBE_WORKER_URL
+
+            while IFS= read -r line || [ -n "$line" ]; do
+              [ -z "$line" ] && continue
+              check_v4 "$line" &
+              if [ "$(jobs -r | wc -l)" -ge 8 ]; then
+                wait -n || true
+              fi
+            done < nrt_hits.txt
+            wait
+
+            find v4check_workspace -name "*.txt" -type f -exec cat {} + 2>/dev/null > nrt_hits_tagged.txt || cp nrt_hits.txt nrt_hits_tagged.txt
+            rm -rf v4check_workspace
+          fi
+
+          v4_count=$(grep -c '(v4)$' nrt_hits_tagged.txt 2>/dev/null)
+          [ -z "$v4_count" ] && v4_count=0
+          nrt_total=$(wc -l < nrt_hits_tagged.txt)
+          non_v4_count=$((nrt_total - v4_count))
+
+          echo "v4_count=${v4_count}" >> "$GITHUB_ENV"
+          echo "non_v4_count=${non_v4_count}" >> "$GITHUB_ENV"
+          echo "nrt_total=${nrt_total}" >> "$GITHUB_ENV"
+
+      - name: "Summary"
+        run: |
+          segment=$(python3 -c "import json;print(json.load(open('segment_info.json'))['segment'])")
+          announced=$(python3 -c "import json;print(json.load(open('segment_info.json'))['matched_announced_prefix'])")
+          host_count=$(python3 -c "import json;print(json.load(open('segment_info.json'))['host_count'])")
+          probed_total=$(wc -l < candidates.txt 2>/dev/null || echo 0)
+          cf_total=$(wc -l < all_hits.txt 2>/dev/null || echo 0)
+
+          echo "## AS906 One-off 段探测结果（目标 IP：103.117.103.199）" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 命中的 AS906 宣告前缀：\`${announced}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 归一化后探测段：\`${segment}\`（可用主机数：${host_count}）" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 本次全量探测数：${probed_total}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 通过 CF 边缘验证(全部colo)：${cf_total}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 其中 colo=NRT：${nrt_total}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - 通过 Worker 严格 IPv4-only 校验(v4)：${v4_count}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - 非 v4（未打标签，含未配置Worker时的全部NRT命中）：${non_v4_count}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### colo=NRT 命中明细（含 v4 标签）" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s nrt_hits_tagged.txt ]; then
+            cat nrt_hits_tagged.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(无)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
